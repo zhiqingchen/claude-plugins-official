@@ -65,6 +65,8 @@ type GroupPolicy = {
   allowFrom: string[]
 }
 
+type ReplyFormat = 'text' | 'markdownv2'
+
 type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
@@ -93,6 +95,16 @@ function defaultAccess(): Access {
 
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+function parseReplyFormat(value: unknown): ReplyFormat {
+  if (value == null) return 'text'
+  if (value === 'text' || value === 'markdownv2') return value
+  throw new Error(`unsupported format: ${String(value)} (expected "text" or "markdownv2")`)
+}
+
+function parseModeForFormat(format: ReplyFormat): 'MarkdownV2' | undefined {
+  return format === 'markdownv2' ? 'MarkdownV2' : undefined
+}
 
 // reply's files param takes any path. .env is ~60 bytes and ships as a
 // document. Claude can already Read+paste file contents, so this isn't a new
@@ -341,7 +353,7 @@ const mcp = new Server(
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message to update a message you previously sent (e.g. progress → result).',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Set format to "markdownv2" when the text is already valid Telegram MarkdownV2; this channel does not convert generic Markdown for you. Use react to add emoji reactions, and edit_message to update a message you previously sent (e.g. progress → result).',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -355,7 +367,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, files (absolute paths) to attach images or documents, and format="markdownv2" when the text is already valid Telegram MarkdownV2.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -369,6 +381,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'string' },
             description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
+          },
+          format: {
+            type: 'string',
+            enum: ['text', 'markdownv2'],
+            description: 'Text formatting mode. markdownv2 uses Telegram MarkdownV2; content must already be escaped/formatted for Telegram.',
           },
         },
         required: ['chat_id', 'text'],
@@ -389,13 +406,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'edit_message',
-      description: 'Edit a message the bot previously sent. Useful for progress updates (send "working…" then edit to the result).',
+      description: 'Edit a message the bot previously sent. Useful for progress updates (send "working…" then edit to the result). Pass format="markdownv2" when the edited text is valid Telegram MarkdownV2.',
       inputSchema: {
         type: 'object',
         properties: {
           chat_id: { type: 'string' },
           message_id: { type: 'string' },
           text: { type: 'string' },
+          format: {
+            type: 'string',
+            enum: ['text', 'markdownv2'],
+            description: 'Text formatting mode. markdownv2 uses Telegram MarkdownV2; content must already be escaped/formatted for Telegram.',
+          },
         },
         required: ['chat_id', 'message_id', 'text'],
       },
@@ -412,6 +434,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
+        const format = parseReplyFormat(args.format)
+        const parse_mode = parseModeForFormat(format)
 
         assertAllowedChat(chat_id)
 
@@ -427,6 +451,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
+        // MarkdownV2 is applied per chunk; formatting must not span chunk boundaries.
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
@@ -438,6 +463,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               (replyMode === 'all' || i === 0)
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(parse_mode ? { parse_mode } : {}),
             })
             sentIds.push(sent.message_id)
           }
@@ -480,10 +506,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
+        const format = parseReplyFormat(args.format)
+        const parse_mode = parseModeForFormat(format)
         const edited = await bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
           args.text as string,
+          { ...(parse_mode ? { parse_mode } : {}) },
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
